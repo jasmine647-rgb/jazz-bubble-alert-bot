@@ -50,8 +50,30 @@ WATCHLIST_IDS = [
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 
-# coin_id -> datetime of last alert (for cooldown)
+# Persisted cooldown state. On GitHub Actions each run is a fresh machine, so we
+# load/save the last-alert times from a small JSON file (committed back by the
+# workflow) to avoid re-alerting the same coin every run.
+import json
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+# coin_id (str) -> ISO timestamp of last alert
 _last_alert = {}
+
+
+def load_state():
+    global _last_alert
+    try:
+        with open(STATE_FILE, "r") as f:
+            _last_alert = json.load(f)
+    except Exception:
+        _last_alert = {}
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(_last_alert, f)
+    except Exception as e:
+        print(f"[state save error] {e}")
 
 
 def fetch_quotes(ids):
@@ -73,10 +95,14 @@ def send_telegram(text):
 
 
 def on_cooldown(coin_id):
-    last = _last_alert.get(coin_id)
+    last = _last_alert.get(str(coin_id))
     if not last:
         return False
-    age_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except Exception:
+        return False
+    age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
     return age_min < COOLDOWN_MINUTES
 
 
@@ -174,7 +200,7 @@ def check_once():
                 exchanges = get_exchanges(name, symbol)
                 msg = build_card(name, symbol, rank, change_1h, exchanges)
                 send_telegram(msg)
-                _last_alert[coin_id] = datetime.now(timezone.utc)
+                _last_alert[str(coin_id)] = datetime.now(timezone.utc).isoformat()
                 hits += 1
                 print(f"ALERT {symbol} {change_1h:+.2f}%")
         except Exception as e:
@@ -193,12 +219,22 @@ def main():
     if missing:
         raise SystemExit(f"Missing in .env: {', '.join(missing)}")
 
+    load_state()
+
+    # RUN_MODE=once -> single check then exit (used by GitHub Actions schedule).
+    # Default -> continuous loop (used when running on your own PC).
+    if os.getenv("RUN_MODE", "").lower() == "once":
+        check_once()
+        save_state()
+        return
+
     print(f"Pump/Dip bot started. Threshold ±{THRESHOLD_PCT}% (1h), "
           f"polling every {POLL_SECONDS}s, cooldown {COOLDOWN_MINUTES}m.")
     send_telegram(f"✅ Pump/Dip bot online. Alerting on ±{THRESHOLD_PCT}% 1h moves.")
 
     while True:
         check_once()
+        save_state()
         time.sleep(POLL_SECONDS)
 
 
